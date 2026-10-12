@@ -9,12 +9,12 @@ import hashlib
 import hmac
 import json
 import os
+import tempfile
 import random
 import re
 import secrets
 import subprocess
 import sys
-import tempfile
 import time
 import urllib.parse
 from pathlib import Path
@@ -45,7 +45,7 @@ DH_G = 7
 
 CONFIG_DIR = Path(os.environ.get("GTC_CONFIG_DIR", Path.home() / ".config" / "gtc"))
 CRED_FILE = CONFIG_DIR / "credentials.json"
-RESULTS_DIR = Path(os.environ.get("GTC_RESULTS_DIR", Path(__file__).resolve().parent / "results"))
+RESULTS_DIR = Path(os.environ.get("GTC_RESULTS_DIR", CONFIG_DIR / "results"))
 
 
 class GtcError(Exception):
@@ -164,12 +164,21 @@ def load_store() -> dict:
 
 
 def save_store(store: dict) -> None:
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    CRED_FILE.write_text(json.dumps(store, indent=2), "utf-8")
+    CONFIG_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    # NamedTemporaryFile creates mode 0600 before any credential bytes are written.
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=CONFIG_DIR, delete=False) as fh:
+        temporary = Path(fh.name)
+        try:
+            json.dump(store, fh, indent=2)
+            fh.flush()
+            os.fsync(fh.fileno())
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            raise
     try:
-        os.chmod(CRED_FILE, 0o600)  # no-op on Windows, matters on POSIX
-    except OSError:
-        pass
+        os.replace(temporary, CRED_FILE)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def get_cred(store: dict, name: str | None) -> tuple[str, dict]:
@@ -219,8 +228,9 @@ def api_subscription(cred: dict) -> dict:
 
 
 def show_captcha(b64_image: str) -> Path:
-    path = Path(tempfile.gettempdir()) / f"gtc_captcha_{int(time.time())}.jpg"
-    path.write_bytes(base64.b64decode(b64_image))
+    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as image_file:
+        image_file.write(base64.b64decode(b64_image))
+        path = Path(image_file.name)
     try:
         if sys.platform == "win32":
             os.startfile(path)  # noqa: S606
@@ -270,7 +280,7 @@ def cmd_batch(args) -> int:
         col = next(i for i, h in enumerate(header)
                    if h.strip().lower() in ("phone", "phone_number", "phonenumber", "nomor"))
         rows = rows[1:]
-    out = csv.writer(sys.stdout if args.out == "-" else open(args.out, "w", newline="", encoding="utf-8"))
+    out = csv.writer(sys.stdout if args.out == "-" else os.fdopen(os.open(args.out, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w", newline="", encoding="utf-8"))
     out.writerow(["phone", "status", "displayName", "tagCount", "tags", "error"])
     for row in rows:
         if not row or not row[col].strip():
@@ -356,16 +366,14 @@ def cmd_generate(args) -> int:
         "x-req-signature": _sig(ts, raw, HMAC_KEY),
     })
     if r.status_code != 201:
-        raise GtcError(f"register failed: HTTP {r.status_code} {r.text[:200]}")
+        raise GtcError(f"register failed: HTTP {r.status_code}")
     reg = r.json()
     token = dig(reg, "result.token")
     server_key = dig(reg, "result.serverKey")
     if not token or not server_key:
-        raise GtcError(f"register: missing token/serverKey: {reg}")
+        raise GtcError("register: missing required credentials")
     final_key = dh_final_key(priv, server_key)
-    print(f"clientDeviceId : {device_id}")
-    print(f"finalKey       : {final_key}")
-    print(f"token          : {token}")
+    print("Account credentials received; values are not written to console or result logs.")
 
     common = dict(token=token, final_key=final_key, device_id=device_id)
     base = {"carrierCountryCode": CARRIER[0], "carrierName": CARRIER[1],
@@ -405,7 +413,7 @@ def cmd_generate(args) -> int:
     deeplink = dig(body, "result.deeplink")
     reference = dig(body, "result.reference")
     if not deeplink or not reference:
-        raise GtcError(f"vfk start failed (HTTP {code}): {body}")
+        raise GtcError(f"vfk start failed (HTTP {code})")
     codes = re.findall(r"\*(.*?)\*", urllib.parse.unquote(deeplink))
     verification = next((c for c in codes if re.fullmatch(r"[A-Za-z0-9]+(?:-[A-Za-z0-9]+)+", c)), None)
     gtc_call("/v2.8/validation-start",
@@ -421,12 +429,12 @@ def cmd_generate(args) -> int:
     code, body = vfk_call("/v2.0/check", {"reference": reference, "bundleId": BUNDLE_ID}, device_id)
     session_id = dig(body, "result.sessionId")
     if not session_id:
-        raise GtcError(f"Verification not completed yet (HTTP {code}): {body}")
+        raise GtcError(f"Verification not completed yet (HTTP {code})")
     code, body = gtc_call("/v2.8/verifykit-result",
                           {"sessionId": session_id, "token": token}, **common)
     validation_date = dig(body, "result.validationDate")
     if not validation_date:
-        raise GtcError(f"verifykit-result failed (HTTP {code}): {body}")
+        raise GtcError(f"verifykit-result failed (HTTP {code})")
 
     store = load_store()
     name = args.name or phone
@@ -579,7 +587,7 @@ class _Tee:
 
 
 def open_result_file(args) -> Path:
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    RESULTS_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
     parts = [time.strftime("%Y%m%d-%H%M%S"), args.cmd]
     for extra in (getattr(args, "phone", None), getattr(args, "action", None)):
         if extra:
@@ -668,10 +676,10 @@ def main(argv=None) -> int:
     if not os.environ.get("GTC_NO_BANNER"):
         print_startup(args)
     if getattr(args, "out", None) in (None, "-") and args.cmd == "batch":
-        RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+        RESULTS_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
         args.out = str(RESULTS_DIR / f"{time.strftime('%Y%m%d-%H%M%S')}-batch.csv")
     result_path = open_result_file(args)
-    fh = result_path.open("w", encoding="utf-8")
+    fh = os.fdopen(os.open(result_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w", encoding="utf-8")
     real_stdout, sys.stdout = sys.stdout, _Tee(sys.stdout, fh)
     try:
         return args.func(args)

@@ -1,0 +1,6 @@
+# Local account credentials and lookup results contain private data.
+credentials.json
+results/
+.env
+__pycache__/
+*.csv
